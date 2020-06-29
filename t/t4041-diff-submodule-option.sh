@@ -11,6 +11,9 @@ This test tries to verify the sanity of the --submodule option of git diff.
 
 . ./test-lib.sh
 
+# Tested non-UTF-8 encoding
+test_encoding="ISO8859-1"
+
 # String "added" in German (translated with Google Translate), encoded in UTF-8,
 # used in sample commit log messages in add_file() function below.
 added=$(printf "hinzugef\303\274gt")
@@ -23,8 +26,10 @@ add_file () {
 			echo "$name" >"$name" &&
 			git add "$name" &&
 			test_tick &&
-			msg_added_iso88591=$(echo "Add $name ($added $name)" | iconv -f utf-8 -t iso8859-1) &&
-			git -c 'i18n.commitEncoding=iso8859-1' commit -m "$msg_added_iso88591"
+			# "git commit -m" would break MinGW, as Windows refuse to pass
+			# $test_encoding encoded parameter to git.
+			echo "Add $name ($added $name)" | iconv -f utf-8 -t $test_encoding |
+			git -c "i18n.commitEncoding=$test_encoding" commit -F -
 		done >/dev/null &&
 		git rev-parse --short --verify HEAD
 	)
@@ -252,9 +257,7 @@ test_expect_success 'typechanged submodule(blob->submodule)' '
 commit_file sm1 &&
 test_expect_success 'submodule is up to date' '
 	git diff-index -p --submodule=log HEAD >actual &&
-	cat >expected <<-EOF &&
-	EOF
-	test_cmp expected actual
+	test_must_be_empty actual
 '
 
 test_expect_success 'submodule contains untracked content' '
@@ -268,20 +271,20 @@ test_expect_success 'submodule contains untracked content' '
 
 test_expect_success 'submodule contains untracked content (untracked ignored)' '
 	git diff-index -p --ignore-submodules=untracked --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
 test_expect_success 'submodule contains untracked content (dirty ignored)' '
 	git diff-index -p --ignore-submodules=dirty --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
 test_expect_success 'submodule contains untracked content (all ignored)' '
 	git diff-index -p --ignore-submodules=all --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
-test_expect_success 'submodule contains untracked and modifed content' '
+test_expect_success 'submodule contains untracked and modified content' '
 	echo new > sm1/foo6 &&
 	git diff-index -p --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -291,7 +294,7 @@ test_expect_success 'submodule contains untracked and modifed content' '
 	test_cmp expected actual
 '
 
-test_expect_success 'submodule contains untracked and modifed content (untracked ignored)' '
+test_expect_success 'submodule contains untracked and modified content (untracked ignored)' '
 	echo new > sm1/foo6 &&
 	git diff-index -p --ignore-submodules=untracked --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -300,19 +303,19 @@ test_expect_success 'submodule contains untracked and modifed content (untracked
 	test_cmp expected actual
 '
 
-test_expect_success 'submodule contains untracked and modifed content (dirty ignored)' '
+test_expect_success 'submodule contains untracked and modified content (dirty ignored)' '
 	echo new > sm1/foo6 &&
 	git diff-index -p --ignore-submodules=dirty --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
-test_expect_success 'submodule contains untracked and modifed content (all ignored)' '
+test_expect_success 'submodule contains untracked and modified content (all ignored)' '
 	echo new > sm1/foo6 &&
 	git diff-index -p --ignore-submodules --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
-test_expect_success 'submodule contains modifed content' '
+test_expect_success 'submodule contains modified content' '
 	rm -f sm1/new-file &&
 	git diff-index -p --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -363,10 +366,10 @@ test_expect_success 'modified submodule contains untracked content (dirty ignore
 
 test_expect_success 'modified submodule contains untracked content (all ignored)' '
 	git diff-index -p --ignore-submodules=all --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
-test_expect_success 'modified submodule contains untracked and modifed content' '
+test_expect_success 'modified submodule contains untracked and modified content' '
 	echo modification >> sm1/foo6 &&
 	git diff-index -p --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -378,7 +381,7 @@ test_expect_success 'modified submodule contains untracked and modifed content' 
 	test_cmp expected actual
 '
 
-test_expect_success 'modified submodule contains untracked and modifed content (untracked ignored)' '
+test_expect_success 'modified submodule contains untracked and modified content (untracked ignored)' '
 	echo modification >> sm1/foo6 &&
 	git diff-index -p --ignore-submodules=untracked --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -389,7 +392,7 @@ test_expect_success 'modified submodule contains untracked and modifed content (
 	test_cmp expected actual
 '
 
-test_expect_success 'modified submodule contains untracked and modifed content (dirty ignored)' '
+test_expect_success 'modified submodule contains untracked and modified content (dirty ignored)' '
 	echo modification >> sm1/foo6 &&
 	git diff-index -p --ignore-submodules=dirty --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -399,13 +402,13 @@ test_expect_success 'modified submodule contains untracked and modifed content (
 	test_cmp expected actual
 '
 
-test_expect_success 'modified submodule contains untracked and modifed content (all ignored)' '
+test_expect_success 'modified submodule contains untracked and modified content (all ignored)' '
 	echo modification >> sm1/foo6 &&
 	git diff-index -p --ignore-submodules --submodule=log HEAD >actual &&
-	! test -s actual
+	test_must_be_empty actual
 '
 
-test_expect_success 'modified submodule contains modifed content' '
+test_expect_success 'modified submodule contains modified content' '
 	rm -f sm1/new-file &&
 	git diff-index -p --submodule=log HEAD >actual &&
 	cat >expected <<-EOF &&
@@ -425,9 +428,11 @@ test_expect_success 'deleted submodule' '
 	test_cmp expected actual
 '
 
-test_create_repo sm2 &&
-head7=$(add_file sm2 foo8 foo9) &&
-git add sm2
+test_expect_success 'create second submodule' '
+	test_create_repo sm2 &&
+	head7=$(add_file sm2 foo8 foo9) &&
+	git add sm2
+'
 
 test_expect_success 'multiple submodules' '
 	git diff-index -p --submodule=log HEAD >actual &&
@@ -491,7 +496,7 @@ test_expect_success 'given commit --submodule=short' '
 test_expect_success 'setup .git file for sm2' '
 	(cd sm2 &&
 	 REAL="$(pwd)/../.real" &&
-	 mv .git "$REAL"
+	 mv .git "$REAL" &&
 	 echo "gitdir: $REAL" >.git)
 '
 
@@ -520,13 +525,15 @@ test_expect_success 'diff --submodule with objects referenced by alternates' '
 		git commit -m "sub a"
 	) &&
 	(cd sub_alt &&
-		sha1_before=$(git rev-parse --short HEAD)
+		sha1_before=$(git rev-parse --short HEAD) &&
 		echo b >b &&
 		git add b &&
-		git commit -m b
-		sha1_after=$(git rev-parse --short HEAD)
-		echo "Submodule sub $sha1_before..$sha1_after:
-  > b" >../expected
+		git commit -m b &&
+		sha1_after=$(git rev-parse --short HEAD) &&
+		{
+			echo "Submodule sub $sha1_before..$sha1_after:" &&
+			echo "  > b"
+		} >../expected
 	) &&
 	(cd super &&
 		(cd sub &&
@@ -534,7 +541,7 @@ test_expect_success 'diff --submodule with objects referenced by alternates' '
 			git checkout origin/master
 		) &&
 		git diff --submodule > ../actual
-	)
+	) &&
 	test_cmp expected actual
 '
 

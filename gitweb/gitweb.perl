@@ -10,6 +10,8 @@
 use 5.008;
 use strict;
 use warnings;
+# handle ACL in file access tests
+use filetest 'access';
 use CGI qw(:standard :escapeHTML -nosticky);
 use CGI::Util qw(unescape);
 use CGI::Carp qw(fatalsToBrowser set_message);
@@ -18,7 +20,13 @@ use Fcntl ':mode';
 use File::Find qw();
 use File::Basename qw(basename);
 use Time::HiRes qw(gettimeofday tv_interval);
+use Digest::MD5 qw(md5_hex);
+
 binmode STDOUT, ':utf8';
+
+if (!defined($CGI::VERSION) || $CGI::VERSION < 4.08) {
+	eval 'sub CGI::multi_param { CGI::param(@_) }'
+}
 
 our $t0 = [ gettimeofday() ];
 our $number_of_git_cmds = 0;
@@ -484,7 +492,6 @@ our %feature = (
 	# Currently available providers are gravatar and picon.
 	# If an unknown provider is specified, the feature is disabled.
 
-	# Gravatar depends on Digest::MD5.
 	# Picon currently relies on the indiana.edu database.
 
 	# To enable system wide have in $GITWEB_CONFIG
@@ -734,7 +741,7 @@ sub evaluate_gitweb_config {
 	$GITWEB_CONFIG_SYSTEM = "" if ($GITWEB_CONFIG_SYSTEM eq $GITWEB_CONFIG_COMMON);
 
 	# Common system-wide settings for convenience.
-	# Those settings can be ovverriden by GITWEB_CONFIG or GITWEB_CONFIG_SYSTEM.
+	# Those settings can be overridden by GITWEB_CONFIG or GITWEB_CONFIG_SYSTEM.
 	read_config_file($GITWEB_CONFIG_COMMON);
 
 	# Use first config file that exists.  This means use the per-instance
@@ -780,6 +787,38 @@ sub check_loadavg {
 
 # ======================================================================
 # input validation and dispatch
+
+# Various hash size-related values.
+my $sha1_len = 40;
+my $sha256_extra_len = 24;
+my $sha256_len = $sha1_len + $sha256_extra_len;
+
+# A regex matching $len hex characters. $len may be a range (e.g. 7,64).
+sub oid_nlen_regex {
+	my $len = shift;
+	my $hchr = qr/[0-9a-fA-F]/;
+	return qr/(?:(?:$hchr){$len})/;
+}
+
+# A regex matching two sets of $nlen hex characters, prefixed by the literal
+# string $prefix and with the literal string $infix between them.
+sub oid_nlen_prefix_infix_regex {
+	my $nlen = shift;
+	my $prefix = shift;
+	my $infix = shift;
+
+	my $rx = oid_nlen_regex($nlen);
+
+	return qr/^\Q$prefix\E$rx\Q$infix\E$rx$/;
+}
+
+# A regex matching a valid object ID.
+our $oid_regex;
+{
+	my $x = oid_nlen_regex($sha1_len);
+	my $y = oid_nlen_regex($sha256_extra_len);
+	$oid_regex = qr/(?:$x(?:$y)?)/;
+}
 
 # input parameters can be collected from a variety of sources (presently, CGI
 # and PATH_INFO), so we define an %input_params hash that collects them all
@@ -871,7 +910,7 @@ sub evaluate_query_params {
 
 	while (my ($name, $symbol) = each %cgi_param_mapping) {
 		if ($symbol eq 'opt') {
-			$input_params{$name} = [ map { decode_utf8($_) } $cgi->param($symbol) ];
+			$input_params{$name} = [ map { decode_utf8($_) } $cgi->multi_param($symbol) ];
 		} else {
 			$input_params{$name} = decode_utf8($cgi->param($symbol));
 		}
@@ -1160,18 +1199,8 @@ sub configure_gitweb_features {
 	our @snapshot_fmts = gitweb_get_feature('snapshot');
 	@snapshot_fmts = filter_snapshot_fmts(@snapshot_fmts);
 
-	# check that the avatar feature is set to a known provider name,
-	# and for each provider check if the dependencies are satisfied.
-	# if the provider name is invalid or the dependencies are not met,
-	# reset $git_avatar to the empty string.
 	our ($git_avatar) = gitweb_get_feature('avatar');
-	if ($git_avatar eq 'gravatar') {
-		$git_avatar = '' unless (eval { require Digest::MD5; 1; });
-	} elsif ($git_avatar eq 'picon') {
-		# no dependencies
-	} else {
-		$git_avatar = '';
-	}
+	$git_avatar = '' unless $git_avatar =~ /^(?:gravatar|picon)$/s;
 
 	our @extra_branch_refs = gitweb_get_feature('extra-branch-refs');
 	@extra_branch_refs = filter_and_validate_refs (@extra_branch_refs);
@@ -1262,9 +1291,23 @@ our $is_last_request = sub { 1 };
 our ($pre_dispatch_hook, $post_dispatch_hook, $pre_listen_hook);
 our $CGI = 'CGI';
 our $cgi;
+our $FCGI_Stream_PRINT_raw = \&FCGI::Stream::PRINT;
 sub configure_as_fcgi {
 	require CGI::Fast;
 	our $CGI = 'CGI::Fast';
+	# FCGI is not Unicode aware hence the UTF-8 encoding must be done manually.
+	# However no encoding must be done within git_blob_plain() and git_snapshot()
+	# which must still output in raw binary mode.
+	no warnings 'redefine';
+	my $enc = Encode::find_encoding('UTF-8');
+	*FCGI::Stream::PRINT = sub {
+		my @OUTPUT = @_;
+		for (my $i = 1; $i < @_; $i++) {
+			$OUTPUT[$i] = $enc->encode($_[$i], Encode::FB_CROAK|Encode::LEAVE_SRC);
+		}
+		@_ = @OUTPUT;
+		goto $FCGI_Stream_PRINT_raw;
+	};
 
 	my $request_number = 0;
 	# let each child service 100 requests
@@ -1490,7 +1533,7 @@ sub is_valid_pathname {
 	my $input = shift;
 
 	return undef unless defined $input;
-	# no '.' or '..' as elements of path, i.e. no '.' nor '..'
+	# no '.' or '..' as elements of path, i.e. no '.' or '..'
 	# at the beginning, at the end, and between slashes.
 	# also this catches doubled slashes
 	if ($input =~ m!(^|/)(|\.|\.\.)(/|$)!) {
@@ -1519,7 +1562,7 @@ sub is_valid_refname {
 
 	return undef unless defined $input;
 	# textual hashes are O.K.
-	if ($input =~ m/^[0-9a-fA-F]{40}$/) {
+	if ($input =~ m/^$oid_regex$/) {
 		return 1;
 	}
 	# it must be correct pathname
@@ -1612,7 +1655,7 @@ sub esc_path {
 	return $str;
 }
 
-# Sanitize for use in XHTML + application/xml+xhtm (valid XML 1.0)
+# Sanitize for use in XHTML + application/xml+xhtml (valid XML 1.0)
 sub sanitize {
 	my $str = shift;
 
@@ -1628,15 +1671,15 @@ sub quot_cec {
 	my $cntrl = shift;
 	my %opts = @_;
 	my %es = ( # character escape codes, aka escape sequences
-		"\t" => '\t',   # tab            (HT)
-		"\n" => '\n',   # line feed      (LF)
-		"\r" => '\r',   # carrige return (CR)
-		"\f" => '\f',   # form feed      (FF)
-		"\b" => '\b',   # backspace      (BS)
-		"\a" => '\a',   # alarm (bell)   (BEL)
-		"\e" => '\e',   # escape         (ESC)
-		"\013" => '\v', # vertical tab   (VT)
-		"\000" => '\0', # nul character  (NUL)
+		"\t" => '\t',   # tab             (HT)
+		"\n" => '\n',   # line feed       (LF)
+		"\r" => '\r',   # carriage return (CR)
+		"\f" => '\f',   # form feed       (FF)
+		"\b" => '\b',   # backspace       (BS)
+		"\a" => '\a',   # alarm (bell)    (BEL)
+		"\e" => '\e',   # escape          (ESC)
+		"\013" => '\v', # vertical tab    (VT)
+		"\000" => '\0', # nul character   (NUL)
 	);
 	my $chr = ( (exists $es{$cntrl})
 		    ? $es{$cntrl}
@@ -2031,11 +2074,28 @@ sub file_type_long {
 sub format_log_line_html {
 	my $line = shift;
 
+	# Potentially abbreviated OID.
+	my $regex = oid_nlen_regex("7,64");
+
 	$line = esc_html($line, -nbsp=>1);
-	$line =~ s{\b([0-9a-fA-F]{8,40})\b}{
+	$line =~ s{
+        \b
+        (
+            # The output of "git describe", e.g. v2.10.0-297-gf6727b0
+            # or hadoop-20160921-113441-20-g094fb7d
+            (?<!-) # see strbuf_check_tag_ref(). Tags can't start with -
+            [A-Za-z0-9.-]+
+            (?!\.) # refs can't end with ".", see check_refname_format()
+            -g$regex
+            |
+            # Just a normal looking Git SHA1
+	    $regex
+        )
+        \b
+    }{
 		$cgi->a({-href => href(action=>"object", hash=>$1),
 					-class => "text"}, $1);
-	}eg;
+	}egx;
 
 	return $line;
 }
@@ -2086,7 +2146,7 @@ sub format_ref_marker {
 				-href => href(
 					action=>$dest_action,
 					hash=>$dest
-				)}, $name);
+				)}, esc_html($name));
 
 			$markers .= " <span class=\"".esc_attr($class)."\" title=\"".esc_attr($ref)."\">" .
 				$link . "</span>";
@@ -2147,7 +2207,7 @@ sub gravatar_url {
 	my $size = shift;
 	$avatar_cache{$email} ||=
 		"//www.gravatar.com/avatar/" .
-			Digest::MD5::md5_hex($email) . "?s=";
+			md5_hex($email) . "?s=";
 	return $avatar_cache{$email} . $size;
 }
 
@@ -2275,7 +2335,8 @@ sub format_extended_diff_header_line {
 		         ')</span>';
 	}
 	# match <hash>
-	if ($line =~ m/^index [0-9a-fA-F]{40},[0-9a-fA-F]{40}/) {
+	if ($line =~ oid_nlen_prefix_infix_regex($sha1_len, "index ", ",") |
+	    $line =~ oid_nlen_prefix_infix_regex($sha256_len, "index ", ",")) {
 		# can match only for combined diff
 		$line = 'index ';
 		for (my $i = 0; $i < $diffinfo->{'nparents'}; $i++) {
@@ -2297,7 +2358,8 @@ sub format_extended_diff_header_line {
 			$line .= '0' x 7;
 		}
 
-	} elsif ($line =~ m/^index [0-9a-fA-F]{40}..[0-9a-fA-F]{40}/) {
+	} elsif ($line =~ oid_nlen_prefix_infix_regex($sha1_len, "index ", "..") |
+		 $line =~ oid_nlen_prefix_infix_regex($sha256_len, "index ", "..")) {
 		# can match only for ordinary diff
 		my ($from_link, $to_link);
 		if ($from->{'href'}) {
@@ -2823,7 +2885,7 @@ sub git_get_hash_by_path {
 	}
 
 	#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa	panic.c'
-	$line =~ m/^([0-9]+) (.+) ([0-9a-fA-F]{40})\t/;
+	$line =~ m/^([0-9]+) (.+) ($oid_regex)\t/;
 	if (defined $type && $type ne $2) {
 		# type doesn't match
 		return undef;
@@ -3053,6 +3115,8 @@ sub git_get_projects_list {
 				return if (m!^[/.]$!);
 				# only directories can be git repositories
 				return unless (-d $_);
+				# need search permission
+				return unless (-x $_);
 				# don't traverse too deep (Find is super slow on os x)
 				# $project_maxdepth excludes depth of $projectroot
 				if (($File::Find::name =~ tr!/!!) - $pfxdepth > $project_maxdepth) {
@@ -3107,7 +3171,7 @@ sub git_get_projects_list {
 	return @list;
 }
 
-# written with help of Tree::Trie module (Perl Artistic License, GPL compatibile)
+# written with help of Tree::Trie module (Perl Artistic License, GPL compatible)
 # as side effects it sets 'forks' field to list of forks for forked projects
 sub filter_forks_from_projects_list {
 	my $projects = shift;
@@ -3320,7 +3384,7 @@ sub git_get_references {
 
 	while (my $line = <$fd>) {
 		chomp $line;
-		if ($line =~ m!^([0-9a-fA-F]{40})\srefs/($type.*)$!) {
+		if ($line =~ m!^($oid_regex)\srefs/($type.*)$!) {
 			if (defined $refs{$1}) {
 				push @{$refs{$1}}, $2;
 			} else {
@@ -3394,7 +3458,7 @@ sub parse_tag {
 	$tag{'id'} = $tag_id;
 	while (my $line = <$fd>) {
 		chomp $line;
-		if ($line =~ m/^object ([0-9a-fA-F]{40})$/) {
+		if ($line =~ m/^object ($oid_regex)$/) {
 			$tag{'object'} = $1;
 		} elsif ($line =~ m/^type (.+)$/) {
 			$tag{'type'} = $1;
@@ -3438,15 +3502,15 @@ sub parse_commit_text {
 	}
 
 	my $header = shift @commit_lines;
-	if ($header !~ m/^[0-9a-fA-F]{40}/) {
+	if ($header !~ m/^$oid_regex/) {
 		return;
 	}
 	($co{'id'}, my @parents) = split ' ', $header;
 	while (my $line = shift @commit_lines) {
 		last if $line eq "\n";
-		if ($line =~ m/^tree ([0-9a-fA-F]{40})$/) {
+		if ($line =~ m/^tree ($oid_regex)$/) {
 			$co{'tree'} = $1;
-		} elsif ((!defined $withparents) && ($line =~ m/^parent ([0-9a-fA-F]{40})$/)) {
+		} elsif ((!defined $withparents) && ($line =~ m/^parent ($oid_regex)$/)) {
 			push @parents, $1;
 		} elsif ($line =~ m/^author (.*) ([0-9]+) (.*)$/) {
 			$co{'author'} = to_utf8($1);
@@ -3578,7 +3642,7 @@ sub parse_difftree_raw_line {
 
 	# ':100644 100644 03b218260e99b78c6df0ed378e59ed9205ccc96d 3b93d5e7cc7f7dd4ebed13a5cc1a4ad976fc94d8 M	ls-files.c'
 	# ':100644 100644 7f9281985086971d3877aca27704f2aaf9c448ce bc190ebc71bbd923f2b728e505408f5e54bd073a M	rev-tree.c'
-	if ($line =~ m/^:([0-7]{6}) ([0-7]{6}) ([0-9a-fA-F]{40}) ([0-9a-fA-F]{40}) (.)([0-9]{0,3})\t(.*)$/) {
+	if ($line =~ m/^:([0-7]{6}) ([0-7]{6}) ($oid_regex) ($oid_regex) (.)([0-9]{0,3})\t(.*)$/) {
 		$res{'from_mode'} = $1;
 		$res{'to_mode'} = $2;
 		$res{'from_id'} = $3;
@@ -3593,7 +3657,7 @@ sub parse_difftree_raw_line {
 	}
 	# '::100755 100755 100755 60e79ca1b01bc8b057abe17ddab484699a7f5fdb 94067cc5f73388f33722d52ae02f44692bc07490 94067cc5f73388f33722d52ae02f44692bc07490 MR	git-gui/git-gui.sh'
 	# combined diff (for merge commit)
-	elsif ($line =~ s/^(::+)((?:[0-7]{6} )+)((?:[0-9a-fA-F]{40} )+)([a-zA-Z]+)\t(.*)$//) {
+	elsif ($line =~ s/^(::+)((?:[0-7]{6} )+)((?:$oid_regex )+)([a-zA-Z]+)\t(.*)$//) {
 		$res{'nparents'}  = length($1);
 		$res{'from_mode'} = [ split(' ', $2) ];
 		$res{'to_mode'} = pop @{$res{'from_mode'}};
@@ -3603,7 +3667,7 @@ sub parse_difftree_raw_line {
 		$res{'to_file'} = unquote($5);
 	}
 	# 'c512b523472485aef4fff9e57b229d9d243c967f'
-	elsif ($line =~ m/^([0-9a-fA-F]{40})$/) {
+	elsif ($line =~ m/^($oid_regex)$/) {
 		$res{'commit'} = $1;
 	}
 
@@ -3631,7 +3695,7 @@ sub parse_ls_tree_line {
 
 	if ($opts{'-l'}) {
 		#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa   16717	panic.c'
-		$line =~ m/^([0-9]+) (.+) ([0-9a-fA-F]{40}) +(-|[0-9]+)\t(.+)$/s;
+		$line =~ m/^([0-9]+) (.+) ($oid_regex) +(-|[0-9]+)\t(.+)$/s;
 
 		$res{'mode'} = $1;
 		$res{'type'} = $2;
@@ -3644,7 +3708,7 @@ sub parse_ls_tree_line {
 		}
 	} else {
 		#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa	panic.c'
-		$line =~ m/^([0-9]+) (.+) ([0-9a-fA-F]{40})\t(.+)$/s;
+		$line =~ m/^([0-9]+) (.+) ($oid_regex)\t(.+)$/s;
 
 		$res{'mode'} = $1;
 		$res{'type'} = $2;
@@ -3909,7 +3973,7 @@ sub blob_contenttype {
 # guess file syntax for syntax highlighting; return undef if no highlighting
 # the name of syntax can (in the future) depend on syntax highlighter used
 sub guess_file_syntax {
-	my ($highlight, $mimetype, $file_name) = @_;
+	my ($highlight, $file_name) = @_;
 	return undef unless ($highlight && defined $file_name);
 	my $basename = basename($file_name, '.in');
 	return $highlight_basename{$basename}
@@ -3927,12 +3991,16 @@ sub guess_file_syntax {
 # or return original FD if no highlighting
 sub run_highlighter {
 	my ($fd, $highlight, $syntax) = @_;
-	return $fd unless ($highlight && defined $syntax);
+	return $fd unless ($highlight);
 
 	close $fd;
+	my $syntax_arg = (defined $syntax) ? "--syntax $syntax" : "--force";
 	open $fd, quote_command(git_cmd(), "cat-file", "blob", $hash)." | ".
+	          quote_command($^X, '-CO', '-MEncode=decode,FB_DEFAULT', '-pse',
+	            '$_ = decode($fe, $_, FB_DEFAULT) if !utf8::decode($_);',
+	            '--', "-fe=$fallback_encoding")." | ".
 	          quote_command($highlight_bin).
-	          " --replace-tabs=8 --fragment --syntax $syntax |"
+	          " --replace-tabs=8 --fragment $syntax_arg |"
 		or die_error(500, "Couldn't open file or run syntax highlighter");
 	return $fd;
 }
@@ -3994,7 +4062,7 @@ sub print_feed_meta {
 
 			$href_params{'extra_options'} = undef;
 			$href_params{'action'} = $type;
-			$link_attr{'-href'} = href(%href_params);
+			$link_attr{'-href'} = esc_attr(href(%href_params));
 			print "<link ".
 			      "rel=\"$link_attr{'-rel'}\" ".
 			      "title=\"$link_attr{'-title'}\" ".
@@ -4003,7 +4071,7 @@ sub print_feed_meta {
 			      "/>\n";
 
 			$href_params{'extra_options'} = '--no-merges';
-			$link_attr{'-href'} = href(%href_params);
+			$link_attr{'-href'} = esc_attr(href(%href_params));
 			$link_attr{'-title'} .= ' (no merges)';
 			print "<link ".
 			      "rel=\"$link_attr{'-rel'}\" ".
@@ -4016,10 +4084,12 @@ sub print_feed_meta {
 	} else {
 		printf('<link rel="alternate" title="%s projects list" '.
 		       'href="%s" type="text/plain; charset=utf-8" />'."\n",
-		       esc_attr($site_name), href(project=>undef, action=>"project_index"));
+		       esc_attr($site_name),
+		       esc_attr(href(project=>undef, action=>"project_index")));
 		printf('<link rel="alternate" title="%s projects feeds" '.
 		       'href="%s" type="text/x-opml" />'."\n",
-		       esc_attr($site_name), href(project=>undef, action=>"opml"));
+		       esc_attr($site_name),
+		       esc_attr(href(project=>undef, action=>"opml")));
 	}
 }
 
@@ -4100,7 +4170,7 @@ sub print_search_form {
 	if ($use_pathinfo) {
 		$action .= "/".esc_url($project);
 	}
-	print $cgi->startform(-method => "get", -action => $action) .
+	print $cgi->start_form(-method => "get", -action => $action) .
 	      "<div class=\"search\">\n" .
 	      (!$use_pathinfo &&
 	      $cgi->input({-name=>"p", -value=>$project, -type=>"hidden"}) . "\n") .
@@ -4233,8 +4303,8 @@ sub git_footer_html {
 	if (defined $action &&
 	    $action eq 'blame_incremental') {
 		print qq!<script type="text/javascript">\n!.
-		      qq!startBlame("!. href(action=>"blame_data", -replay=>1) .qq!",\n!.
-		      qq!           "!. href() .qq!");\n!.
+		      qq!startBlame("!. esc_attr(href(action=>"blame_data", -replay=>1)) .qq!",\n!.
+		      qq!           "!. esc_attr(href()) .qq!");\n!.
 		      qq!</script>\n!;
 	} else {
 		my ($jstimezone, $tz_cookie, $datetime_class) =
@@ -4354,7 +4424,7 @@ sub git_print_page_nav {
 	      "</div>\n";
 }
 
-# returns a submenu for the nagivation of the refs views (tags, heads,
+# returns a submenu for the navigation of the refs views (tags, heads,
 # remotes) with the current view disabled and the remotes view only
 # available if the feature is enabled
 sub format_ref_views {
@@ -4571,7 +4641,7 @@ sub git_print_log {
 	# print log
 	my $skip_blank_line = 0;
 	foreach my $line (@$log) {
-		if ($line =~ m/^\s*([A-Z][-A-Za-z]*-[Bb]y|C[Cc]): /) {
+		if ($line =~ m/^\s*([A-Z][-A-Za-z]*-([Bb]y|[Tt]o)|C[Cc]|(Clos|Fix)es): /) {
 			if (! $opts{'-remove_signoff'}) {
 				print "<span class=\"signoff\">" . esc_html($line) . "</span><br/>\n";
 				$skip_blank_line = 1;
@@ -4782,7 +4852,7 @@ sub fill_from_file_info {
 sub is_deleted {
 	my $diffinfo = shift;
 
-	return $diffinfo->{'to_id'} eq ('0' x 40);
+	return $diffinfo->{'to_id'} eq ('0' x 40) || $diffinfo->{'to_id'} eq ('0' x 64);
 }
 
 # does patch correspond to [previous] difftree raw line
@@ -5229,7 +5299,7 @@ sub format_ctx_rem_add_lines {
 		#    + c
 		#   +  d
 		#
-		# Otherwise the highlightling would be confusing.
+		# Otherwise the highlighting would be confusing.
 		if ($is_combined) {
 			for (my $i = 0; $i < @$add; $i++) {
 				my $prefix_rem = substr($rem->[$i], 0, $num_parents);
@@ -5510,7 +5580,7 @@ sub git_project_search_form {
 	}
 
 	print "<div class=\"projsearch\">\n";
-	print $cgi->startform(-method => 'get', -action => $my_uri) .
+	print $cgi->start_form(-method => 'get', -action => $my_uri) .
 	      $cgi->hidden(-name => 'a', -value => 'project_list')  . "\n";
 	print $cgi->hidden(-name => 'pf', -value => $project_filter). "\n"
 		if (defined $project_filter);
@@ -5943,6 +6013,9 @@ sub git_history_body {
 		      $cgi->a({-href => href(action=>"commitdiff", hash=>$commit)}, "commitdiff");
 
 		if ($ftype eq 'blob') {
+			print " | " .
+			      $cgi->a({-href => href(action=>"blob_plain", hash_base=>$commit, file_name=>$file_name)}, "raw");
+
 			my $blob_current = $file_hash;
 			my $blob_parent  = git_get_hash_by_path($commit, $file_name);
 			if (defined $blob_current && defined $blob_parent &&
@@ -6265,7 +6338,7 @@ sub git_search_changes {
 			              -class => "list subject"},
 			              chop_and_escape_str($co{'title'}, 50) . "<br/>");
 		} elsif (defined $set{'to_id'}) {
-			next if ($set{'to_id'} =~ m/^0{40}$/);
+			next if is_deleted(\%set);
 
 			print $cgi->a({-href => href(action=>"blob", hash_base=>$co{'id'},
 			                             hash=>$set{'to_id'}, file_name=>$set{'to_file'}),
@@ -6809,7 +6882,7 @@ sub git_blame_common {
 			# the header: <SHA-1> <src lineno> <dst lineno> [<lines in group>]
 			# no <lines in group> for subsequent lines in group of lines
 			my ($full_rev, $orig_lineno, $lineno, $group_size) =
-			   ($line =~ /^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$/);
+			   ($line =~ /^($oid_regex) (\d+) (\d+)(?: (\d+))?$/);
 			if (!exists $metainfo{$full_rev}) {
 				$metainfo{$full_rev} = { 'nprevious' => 0 };
 			}
@@ -6859,7 +6932,7 @@ sub git_blame_common {
 			}
 			# 'previous' <sha1 of parent commit> <filename at commit>
 			if (exists $meta->{'previous'} &&
-			    $meta->{'previous'} =~ /^([a-fA-F0-9]{40}) (.*)$/) {
+			    $meta->{'previous'} =~ /^($oid_regex) (.*)$/) {
 				$meta->{'parent'} = $1;
 				$meta->{'file_parent'} = unquote($2);
 			}
@@ -6976,7 +7049,7 @@ sub git_blob_plain {
 		} else {
 			die_error(400, "No file name defined");
 		}
-	} elsif ($hash =~ m/^[0-9a-fA-F]{40}$/) {
+	} elsif ($hash =~ m/^$oid_regex$/) {
 		# blobs defined by non-textual hash id's can be cached
 		$expires = "+1d";
 	}
@@ -7020,6 +7093,7 @@ sub git_blob_plain {
 			($sandbox ? 'attachment' : 'inline')
 			. '; filename="' . $save_as . '"');
 	local $/ = undef;
+	local *FCGI::Stream::PRINT = $FCGI_Stream_PRINT_raw;
 	binmode STDOUT, ':raw';
 	print <$fd>;
 	binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
@@ -7037,7 +7111,7 @@ sub git_blob {
 		} else {
 			die_error(400, "No file name defined");
 		}
-	} elsif ($hash =~ m/^[0-9a-fA-F]{40}$/) {
+	} elsif ($hash =~ m/^$oid_regex$/) {
 		# blobs defined by non-textual hash id's can be cached
 		$expires = "+1d";
 	}
@@ -7055,9 +7129,8 @@ sub git_blob {
 	$have_blame &&= ($mimetype =~ m!^text/!);
 
 	my $highlight = gitweb_check_feature('highlight');
-	my $syntax = guess_file_syntax($highlight, $mimetype, $file_name);
-	$fd = run_highlighter($fd, $highlight, $syntax)
-		if $syntax;
+	my $syntax = guess_file_syntax($highlight, $file_name);
+	$fd = run_highlighter($fd, $highlight, $syntax);
 
 	git_header_html(undef, $expires);
 	my $formats_nav = '';
@@ -7094,13 +7167,13 @@ sub git_blob {
 	git_print_page_path($file_name, "blob", $hash_base);
 	print "<div class=\"page_body\">\n";
 	if ($mimetype =~ m!^image/!) {
-		print qq!<img type="!.esc_attr($mimetype).qq!"!;
+		print qq!<img class="blob" type="!.esc_attr($mimetype).qq!"!;
 		if ($file_name) {
 			print qq! alt="!.esc_attr($file_name).qq!" title="!.esc_attr($file_name).qq!"!;
 		}
 		print qq! src="! .
-		      href(action=>"blob_plain", hash=>$hash,
-		           hash_base=>$hash_base, file_name=>$file_name) .
+		      esc_attr(href(action=>"blob_plain", hash=>$hash,
+		           hash_base=>$hash_base, file_name=>$file_name)) .
 		      qq!" />\n!;
 	} else {
 		my $nr;
@@ -7110,7 +7183,7 @@ sub git_blob {
 			$line = untabify($line);
 			printf qq!<div class="pre"><a id="l%i" href="%s#l%i" class="linenr">%4i</a> %s</div>\n!,
 			       $nr, esc_attr(href(-replay => 1)), $nr, $nr,
-			       $syntax ? sanitize($line) : esc_html($line, -nbsp=>1);
+			       $highlight ? sanitize($line) : esc_html($line, -nbsp=>1);
 		}
 	}
 	close $fd
@@ -7359,6 +7432,7 @@ sub git_snapshot {
 
 	open my $fd, "-|", $cmd
 		or die_error(500, "Execute git-archive failed");
+	local *FCGI::Stream::PRINT = $FCGI_Stream_PRINT_raw;
 	binmode STDOUT, ':raw';
 	print <$fd>;
 	binmode STDOUT, ':utf8'; # as set at the beginning of gitweb.cgi
@@ -7496,7 +7570,7 @@ sub git_commit {
 
 	# non-textual hash id's can be cached
 	my $expires;
-	if ($hash =~ m/^[0-9a-fA-F]{40}$/) {
+	if ($hash =~ m/^$oid_regex$/) {
 		$expires = "+1d";
 	}
 	my $refs = git_get_references();
@@ -7572,7 +7646,7 @@ sub git_object {
 			git_cmd(), 'cat-file', '-t', $object_id) . ' 2> /dev/null'
 			or die_error(404, "Object does not exist");
 		$type = <$fd>;
-		chomp $type;
+		defined $type && chomp $type;
 		close $fd
 			or die_error(404, "Object does not exist");
 
@@ -7590,7 +7664,7 @@ sub git_object {
 		close $fd;
 
 		#'100644 blob 0fa3f3a66fb6a137f6ec2c19351ed4d807070ffa	panic.c'
-		unless ($line && $line =~ m/^([0-9]+) (.+) ([0-9a-fA-F]{40})\t/) {
+		unless ($line && $line =~ m/^([0-9]+) (.+) ($oid_regex)\t/) {
 			die_error(404, "File or directory for given base does not exist");
 		}
 		$type = $2;
@@ -7630,7 +7704,7 @@ sub git_blobdiff {
 				or die_error(404, "Blob diff not found");
 
 		} elsif (defined $hash &&
-		         $hash =~ /[0-9a-fA-F]{40}/) {
+		         $hash =~ $oid_regex) {
 			# try to find filename from $hash
 
 			# read filtered raw output
@@ -7640,7 +7714,7 @@ sub git_blobdiff {
 			@difftree =
 				# ':100644 100644 03b21826... 3b93d5e7... M	ls-files.c'
 				# $hash == to_id
-				grep { /^:[0-7]{6} [0-7]{6} [0-9a-fA-F]{40} $hash/ }
+				grep { /^:[0-7]{6} [0-7]{6} $oid_regex $hash/ }
 				map { chomp; $_ } <$fd>;
 			close $fd
 				or die_error(404, "Reading git-diff-tree failed");
@@ -7663,8 +7737,8 @@ sub git_blobdiff {
 		$hash        ||= $diffinfo{'to_id'};
 
 		# non-textual hash id's can be cached
-		if ($hash_base =~ m/^[0-9a-fA-F]{40}$/ &&
-		    $hash_parent_base =~ m/^[0-9a-fA-F]{40}$/) {
+		if ($hash_base =~ m/^$oid_regex$/ &&
+		    $hash_parent_base =~ m/^$oid_regex$/) {
 			$expires = '+1d';
 		}
 
@@ -7800,7 +7874,7 @@ sub git_commitdiff {
 		    $hash_parent ne '-c' && $hash_parent ne '--cc') {
 			# commitdiff with two commits given
 			my $hash_parent_short = $hash_parent;
-			if ($hash_parent =~ m/^[0-9a-fA-F]{40}$/) {
+			if ($hash_parent =~ m/^$oid_regex$/) {
 				$hash_parent_short = substr($hash_parent, 0, 7);
 			}
 			$formats_nav .=
@@ -7909,7 +7983,7 @@ sub git_commitdiff {
 
 	# non-textual hash id's can be cached
 	my $expires;
-	if ($hash =~ m/^[0-9a-fA-F]{40}$/) {
+	if ($hash =~ m/^$oid_regex$/) {
 		$expires = "+1d";
 	}
 
@@ -8064,7 +8138,7 @@ sub git_search_help {
 <p><strong>Pattern</strong> is by default a normal string that is matched precisely (but without
 regard to case, except in the case of pickaxe). However, when you check the <em>re</em> checkbox,
 the pattern entered is recognized as the POSIX extended
-<a href="http://en.wikipedia.org/wiki/Regular_expression">regular expression</a> (also case
+<a href="https://en.wikipedia.org/wiki/Regular_expression">regular expression</a> (also case
 insensitive).</p>
 <dl>
 <dt><b>commit</b></dt>
@@ -8183,6 +8257,7 @@ sub git_feed {
 	} else {
 		$alt_url = href(-full=>1, action=>"summary");
 	}
+	$alt_url = esc_attr($alt_url);
 	print qq!<?xml version="1.0" encoding="utf-8"?>\n!;
 	if ($format eq 'rss') {
 		print <<XML;
@@ -8220,7 +8295,7 @@ XML
 		      $alt_url . '" />' . "\n" .
 		      '<link rel="self" type="' . $content_type . '" href="' .
 		      $cgi->self_url() . '" />' . "\n" .
-		      "<id>" . href(-full=>1) . "</id>\n" .
+		      "<id>" . esc_url(href(-full=>1)) . "</id>\n" .
 		      # use project owner for feed author
 		      "<author><name>$owner</name></author>\n";
 		if (defined $favicon) {
@@ -8266,7 +8341,7 @@ XML
 			      "<author>" . esc_html($co{'author'}) . "</author>\n" .
 			      "<pubDate>$cd{'rfc2822'}</pubDate>\n" .
 			      "<guid isPermaLink=\"true\">$co_url</guid>\n" .
-			      "<link>$co_url</link>\n" .
+			      "<link>" . esc_html($co_url) . "</link>\n" .
 			      "<description>" . esc_html($co{'title'}) . "</description>\n" .
 			      "<content:encoded>" .
 			      "<![CDATA[\n";
@@ -8288,8 +8363,8 @@ XML
 			}
 			print "</contributor>\n" .
 			      "<published>$cd{'iso-8601'}</published>\n" .
-			      "<link rel=\"alternate\" type=\"text/html\" href=\"$co_url\" />\n" .
-			      "<id>$co_url</id>\n" .
+			      "<link rel=\"alternate\" type=\"text/html\" href=\"" . esc_attr($co_url) . "\" />\n" .
+			      "<id>" . esc_html($co_url) . "</id>\n" .
 			      "<content type=\"xhtml\" xml:base=\"" . esc_url($my_url) . "\">\n" .
 			      "<div xmlns=\"http://www.w3.org/1999/xhtml\">\n";
 		}
@@ -8396,8 +8471,8 @@ XML
 		}
 
 		my $path = esc_html(chop_str($proj{'path'}, 25, 5));
-		my $rss  = href('project' => $proj{'path'}, 'action' => 'rss', -full => 1);
-		my $html = href('project' => $proj{'path'}, 'action' => 'summary', -full => 1);
+		my $rss  = esc_attr(href('project' => $proj{'path'}, 'action' => 'rss', -full => 1));
+		my $html = esc_attr(href('project' => $proj{'path'}, 'action' => 'summary', -full => 1));
 		print "<outline type=\"rss\" text=\"$path\" title=\"$path\" xmlUrl=\"$rss\" htmlUrl=\"$html\"/>\n";
 	}
 	print <<XML;

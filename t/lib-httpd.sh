@@ -14,7 +14,6 @@
 #
 #	test_expect_success ...
 #
-#	stop_httpd
 #	test_done
 #
 # Can be configured using the following variables.
@@ -24,16 +23,33 @@
 #    LIB_HTTPD_MODULE_PATH       web server modules path
 #    LIB_HTTPD_PORT              listening port
 #    LIB_HTTPD_DAV               enable DAV
-#    LIB_HTTPD_SVN               enable SVN
+#    LIB_HTTPD_SVN               enable SVN at given location (e.g. "svn")
 #    LIB_HTTPD_SSL               enable SSL
 #
 # Copyright (c) 2008 Clemens Buchacher <drizzd@aon.at>
 #
 
-if test -z "$GIT_TEST_HTTPD"
+if test -n "$NO_CURL"
 then
-	skip_all="Network testing disabled (define GIT_TEST_HTTPD to enable)"
+	skip_all='skipping test, git built without http support'
 	test_done
+fi
+
+if test -n "$NO_EXPAT" && test -n "$LIB_HTTPD_DAV"
+then
+	skip_all='skipping test, git built without expat support'
+	test_done
+fi
+
+if ! test_bool_env GIT_TEST_HTTPD true
+then
+	skip_all="Network testing disabled (unset GIT_TEST_HTTPD to enable)"
+	test_done
+fi
+
+if ! test_have_prereq NOT_ROOT; then
+	test_skip_or_die GIT_TEST_HTTPD \
+		"Cannot run httpd tests as root"
 fi
 
 HTTPD_PARA=""
@@ -64,7 +80,7 @@ case $(uname) in
 esac
 
 LIB_HTTPD_PATH=${LIB_HTTPD_PATH-"$DEFAULT_HTTPD_PATH"}
-LIB_HTTPD_PORT=${LIB_HTTPD_PORT-'8111'}
+test_set_port LIB_HTTPD_PORT
 
 TEST_PATH="$TEST_DIRECTORY"/lib-httpd
 HTTPD_ROOT_PATH="$PWD"/httpd
@@ -73,15 +89,16 @@ HTTPD_DOCUMENT_ROOT_PATH=$HTTPD_ROOT_PATH/www
 # hack to suppress apache PassEnv warnings
 GIT_VALGRIND=$GIT_VALGRIND; export GIT_VALGRIND
 GIT_VALGRIND_OPTIONS=$GIT_VALGRIND_OPTIONS; export GIT_VALGRIND_OPTIONS
+GIT_TEST_SIDEBAND_ALL=$GIT_TEST_SIDEBAND_ALL; export GIT_TEST_SIDEBAND_ALL
+GIT_TRACE=$GIT_TRACE; export GIT_TRACE
 
 if ! test -x "$LIB_HTTPD_PATH"
 then
-	skip_all="skipping test, no web server found at '$LIB_HTTPD_PATH'"
-	test_done
+	test_skip_or_die GIT_TEST_HTTPD "no web server found at '$LIB_HTTPD_PATH'"
 fi
 
-HTTPD_VERSION=`$LIB_HTTPD_PATH -v | \
-	sed -n 's/^Server version: Apache\/\([0-9]*\)\..*$/\1/p; q'`
+HTTPD_VERSION=$($LIB_HTTPD_PATH -v | \
+	sed -n 's/^Server version: Apache\/\([0-9]*\)\..*$/\1/p; q')
 
 if test -n "$HTTPD_VERSION"
 then
@@ -89,25 +106,35 @@ then
 	then
 		if ! test $HTTPD_VERSION -ge 2
 		then
-			skip_all="skipping test, at least Apache version 2 is required"
-			test_done
+			test_skip_or_die GIT_TEST_HTTPD \
+				"at least Apache version 2 is required"
 		fi
 		if ! test -d "$DEFAULT_HTTPD_MODULE_PATH"
 		then
-			skip_all="Apache module directory not found.  Skipping tests."
-			test_done
+			test_skip_or_die GIT_TEST_HTTPD \
+				"Apache module directory not found"
 		fi
 
 		LIB_HTTPD_MODULE_PATH="$DEFAULT_HTTPD_MODULE_PATH"
 	fi
 else
-	error "Could not identify web server at '$LIB_HTTPD_PATH'"
+	test_skip_or_die GIT_TEST_HTTPD \
+		"Could not identify web server at '$LIB_HTTPD_PATH'"
 fi
+
+install_script () {
+	write_script "$HTTPD_ROOT_PATH/$1" <"$TEST_PATH/$1"
+}
 
 prepare_httpd() {
 	mkdir -p "$HTTPD_DOCUMENT_ROOT_PATH"
 	cp "$TEST_PATH"/passwd "$HTTPD_ROOT_PATH"
-	cp "$TEST_PATH"/broken-smart-http.sh "$HTTPD_ROOT_PATH"
+	install_script incomplete-length-upload-pack-v2-http.sh
+	install_script incomplete-body-upload-pack-v2-http.sh
+	install_script broken-smart-http.sh
+	install_script error-smart-http.sh
+	install_script error.sh
+	install_script apply-one-time-perl.sh
 
 	ln -s "$LIB_HTTPD_MODULE_PATH" "$HTTPD_ROOT_PATH/modules"
 
@@ -131,15 +158,17 @@ prepare_httpd() {
 	HTTPD_URL_USER=$HTTPD_PROTO://user%40host@$HTTPD_DEST
 	HTTPD_URL_USER_PASS=$HTTPD_PROTO://user%40host:pass%40host@$HTTPD_DEST
 
-	if test -n "$LIB_HTTPD_DAV" -o -n "$LIB_HTTPD_SVN"
+	if test -n "$LIB_HTTPD_DAV" || test -n "$LIB_HTTPD_SVN"
 	then
 		HTTPD_PARA="$HTTPD_PARA -DDAV"
 
 		if test -n "$LIB_HTTPD_SVN"
 		then
 			HTTPD_PARA="$HTTPD_PARA -DSVN"
-			rawsvnrepo="$HTTPD_ROOT_PATH/svnrepo"
-			svnrepo="http://127.0.0.1:$LIB_HTTPD_PORT/svn"
+			LIB_HTTPD_SVNPATH="$rawsvnrepo"
+			svnrepo="http://127.0.0.1:$LIB_HTTPD_PORT/"
+			svnrepo="$svnrepo$LIB_HTTPD_SVN"
+			export LIB_HTTPD_SVN LIB_HTTPD_SVNPATH
 		fi
 	fi
 }
@@ -147,7 +176,7 @@ prepare_httpd() {
 start_httpd() {
 	prepare_httpd >&3 2>&4
 
-	trap 'code=$?; stop_httpd; (exit $code); die' EXIT
+	test_atexit stop_httpd
 
 	"$LIB_HTTPD_PATH" -d "$HTTPD_ROOT_PATH" \
 		-f "$TEST_PATH/apache.conf" $HTTPD_PARA \
@@ -155,15 +184,12 @@ start_httpd() {
 		>&3 2>&4
 	if test $? -ne 0
 	then
-		skip_all="skipping test, web server setup failed"
-		trap 'die' EXIT
-		test_done
+		cat "$HTTPD_ROOT_PATH"/error.log >&4 2>/dev/null
+		test_skip_or_die GIT_TEST_HTTPD "web server setup failed"
 	fi
 }
 
 stop_httpd() {
-	trap 'die' EXIT
-
 	"$LIB_HTTPD_PATH" -d "$HTTPD_ROOT_PATH" \
 		-f "$TEST_PATH/apache.conf" $HTTPD_PARA -k stop
 }
@@ -260,4 +286,25 @@ expect_askpass() {
 	} >"$TRASH_DIRECTORY/askpass-expect" &&
 	test_cmp "$TRASH_DIRECTORY/askpass-expect" \
 		 "$TRASH_DIRECTORY/askpass-query"
+}
+
+strip_access_log() {
+	sed -e "
+		s/^.* \"//
+		s/\"//
+		s/ [1-9][0-9]*\$//
+		s/^GET /GET  /
+	" "$HTTPD_ROOT_PATH"/access.log
+}
+
+# Requires one argument: the name of a file containing the expected stripped
+# access log entries.
+check_access_log() {
+	sort "$1" >"$1".sorted &&
+	strip_access_log >access.log.stripped &&
+	sort access.log.stripped >access.log.sorted &&
+	if ! test_cmp "$1".sorted access.log.sorted
+	then
+		test_cmp "$1" access.log.stripped
+	fi
 }

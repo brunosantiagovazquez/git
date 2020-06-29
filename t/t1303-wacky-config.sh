@@ -14,7 +14,7 @@ setup() {
 check() {
 	echo "$2" >expected
 	git config --get "$1" >actual 2>&1
-	test_cmp actual expected
+	test_cmp expected actual
 }
 
 # 'check section.key regex value' verifies that the entry for
@@ -22,7 +22,7 @@ check() {
 check_regex() {
 	echo "$3" >expected
 	git config --get "$1" "$2" >actual 2>&1
-	test_cmp actual expected
+	test_cmp expected actual
 }
 
 test_expect_success 'modify same key' '
@@ -109,6 +109,26 @@ test_expect_success 'unset many entries' '
 	setup_many &&
 	git config --unset-all section.key &&
 	test_must_fail git config section.key
+'
+
+test_expect_success '--add appends new value after existing empty value' '
+	cat >expect <<-\EOF &&
+
+
+	fool
+	roll
+	EOF
+	cp .git/config .git/config.old &&
+	test_when_finished "mv .git/config.old .git/config" &&
+	cat >.git/config <<-\EOF &&
+	[foo]
+		baz
+		baz =
+		baz = fool
+	EOF
+	git config --add foo.baz roll &&
+	git config --get-all foo.baz >output &&
+	test_cmp expect output
 '
 
 test_done

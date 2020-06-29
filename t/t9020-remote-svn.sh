@@ -25,8 +25,8 @@ init_git () {
 	git init &&
 	#git remote add svnsim testsvn::sim:///$TEST_DIRECTORY/t9020/example.svnrdump
 	# let's reuse an existing dump file!?
-	git remote add svnsim testsvn::sim://$TEST_DIRECTORY/t9154/svn.dump
-	git remote add svnfile testsvn::file://$TEST_DIRECTORY/t9154/svn.dump
+	git remote add svnsim "testsvn::sim://$TEST_DIRECTORY/t9154/svn.dump"
+	git remote add svnfile "testsvn::file://$TEST_DIRECTORY/t9154/svn.dump"
 }
 
 if test -e "$GIT_BUILD_DIR/git-remote-testsvn"
@@ -48,8 +48,8 @@ test_expect_success REMOTE_SVN 'simple fetch' '
 '
 
 test_debug '
-	cat .git/refs/svn/svnsim/master
-	cat .git/refs/remotes/svnsim/master
+	git show-ref -s refs/svn/svnsim/master
+	git show-ref -s refs/remotes/svnsim/master
 '
 
 test_expect_success REMOTE_SVN 'repeated fetch, nothing shall change' '

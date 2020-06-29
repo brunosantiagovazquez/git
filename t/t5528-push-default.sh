@@ -26,7 +26,7 @@ check_pushed_commit () {
 # $2 = expected target branch for the push
 # $3 = [optional] repo to check for actual output (repo1 by default)
 test_push_success () {
-	git -c push.default="$1" push &&
+	git ${1:+-c} ${1:+push.default="$1"} push &&
 	check_pushed_commit HEAD "$2" "$3"
 }
 
@@ -34,7 +34,7 @@ test_push_success () {
 # check that push fails and does not modify any remote branch
 test_push_failure () {
 	git --git-dir=repo1 log --no-walk --format='%h %s' --all >expect &&
-	test_must_fail git -c push.default="$1" push &&
+	test_must_fail git ${1:+-c} ${1:+push.default="$1"} push &&
 	git --git-dir=repo1 log --no-walk --format='%h %s' --all >actual &&
 	test_cmp expect actual
 }
@@ -98,6 +98,16 @@ test_expect_success 'push from/to new branch with upstream, matching and simple'
 	test_push_failure upstream
 '
 
+test_expect_success 'push ambiguously named branch with upstream, matching and simple' '
+	git checkout -b ambiguous &&
+	test_config branch.ambiguous.remote parent1 &&
+	test_config branch.ambiguous.merge refs/heads/ambiguous &&
+	git tag ambiguous &&
+	test_push_success simple ambiguous &&
+	test_push_success matching ambiguous &&
+	test_push_success upstream ambiguous
+'
+
 test_expect_success 'push from/to new branch with current creates remote branch' '
 	test_config branch.new-branch.remote repo1 &&
 	git checkout new-branch &&
@@ -153,7 +163,7 @@ test_pushdefault_workflow success current master
 # update parent1's foo (which is our upstream)
 test_pushdefault_workflow success upstream foo
 
-# upsream is foo which is not the name of the current branch
+# upstream is foo which is not the name of the current branch
 test_pushdefault_workflow failure simple master
 
 # master and foo are updated
@@ -171,5 +181,33 @@ test_pushdefault_workflow success simple master triangular
 
 # master is updated (parent2 does not have foo)
 test_pushdefault_workflow success matching master triangular
+
+# default tests, when no push-default is specified. This
+# should behave the same as "simple" in non-triangular
+# settings, and as "current" otherwise.
+
+test_expect_success 'default behavior allows "simple" push' '
+	test_config branch.master.remote parent1 &&
+	test_config branch.master.merge refs/heads/master &&
+	test_config remote.pushdefault parent1 &&
+	test_commit default-master-master &&
+	test_push_success "" master
+'
+
+test_expect_success 'default behavior rejects non-simple push' '
+	test_config branch.master.remote parent1 &&
+	test_config branch.master.merge refs/heads/foo &&
+	test_config remote.pushdefault parent1 &&
+	test_commit default-master-foo &&
+	test_push_failure ""
+'
+
+test_expect_success 'default triangular behavior acts like "current"' '
+	test_config branch.master.remote parent1 &&
+	test_config branch.master.merge refs/heads/foo &&
+	test_config remote.pushdefault parent2 &&
+	test_commit default-triangular &&
+	test_push_success "" master repo2
+'
 
 test_done

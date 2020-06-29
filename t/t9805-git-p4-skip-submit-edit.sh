@@ -90,16 +90,12 @@ test_expect_success 'no config, edited' '
 		cd "$git" &&
 		echo line >>file1 &&
 		git commit -a -m "change 5" &&
-		P4EDITOR="$TRASH_DIRECTORY/ed.sh" &&
+		P4EDITOR="\"$TRASH_DIRECTORY/ed.sh\"" &&
 		export P4EDITOR &&
 		git p4 submit &&
 		p4 changes //depot/... >wc &&
 		test_line_count = 5 wc
 	)
-'
-
-test_expect_success 'kill p4d' '
-	kill_p4d
 '
 
 test_done

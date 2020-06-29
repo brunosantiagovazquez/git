@@ -181,7 +181,7 @@ On Debian:
 
    Most tests should pass.
 
-A command line tool to test WebDAV is cadaver. If you prefer GUIs, for
+A command-line tool to test WebDAV is cadaver. If you prefer GUIs, for
 example, konqueror can open WebDAV URLs as "webdav://..." or
 "webdavs://...".
 
@@ -244,8 +244,8 @@ Using a proxy:
 --------------
 
 If you have to access the WebDAV server from behind an HTTP(S) proxy,
-set the variable 'all_proxy' to 'http://proxy-host.com:port', or
-'http://login-on-proxy:passwd-on-proxy@proxy-host.com:port'. See 'man
+set the variable 'all_proxy' to `http://proxy-host.com:port`, or
+`http://login-on-proxy:passwd-on-proxy@proxy-host.com:port`. See 'man
 curl' for details.
 
 
